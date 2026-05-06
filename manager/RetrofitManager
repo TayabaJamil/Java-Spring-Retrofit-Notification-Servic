@@ -1,0 +1,56 @@
+package com.portfolio.manager;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import okhttp3.OkHttpClient;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import retrofit2.Retrofit;
+import retrofit2.converter.gson.GsonConverterFactory;
+
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
+
+@Component
+public final class RetrofitManager {
+
+    private static Retrofit alertServiceRetrofit;
+    public static String ALERT_SERVICE_BASE_URL;
+
+    private static final Logger LOG = Logger.getLogger("RetrofitManager");
+
+    private RetrofitManager() {
+    }
+
+    @Value("${onezapp.alert.service.baseUrl}")
+    public void setNameStatic(String baseUrl) {
+        RetrofitManager.ALERT_SERVICE_BASE_URL = baseUrl;
+    }
+
+    public static Retrofit getRetrofit() {
+        if (alertServiceRetrofit != null) {
+            return alertServiceRetrofit;
+        } else {
+            Gson gson = new GsonBuilder().setDateFormat("yyyy-MM-dd HH:mm:ss").create();
+            return alertServiceRetrofit = new Retrofit.Builder().baseUrl(ALERT_SERVICE_BASE_URL)
+                    .client(getClient()).addConverterFactory(GsonConverterFactory.create(gson)).build();
+        }
+
+    }
+
+    private static OkHttpClient getClient() {
+        return new OkHttpClient.Builder().readTimeout(100, TimeUnit.SECONDS).writeTimeout(100, TimeUnit.SECONDS)
+                .connectTimeout(10, TimeUnit.SECONDS).build();
+    }
+
+    private static OkHttpClient getClient(int readTimeout, int connectionTimeout) {
+        return new OkHttpClient.Builder().readTimeout(readTimeout, TimeUnit.SECONDS).writeTimeout(100, TimeUnit.SECONDS)
+                .connectTimeout(connectionTimeout, TimeUnit.SECONDS).build();
+    }
+
+    public static <T> Object getAlertServiceAPI(Class<T> c) {
+        return getRetrofit().create(c);
+    }
+
+}
+
