@@ -1,0 +1,286 @@
+package com.portfolio.service.impl;
+
+import com.portfolio.common.EmailUtils;
+import com.portfolio.dto.ServiceFeeSlabsDTO;
+import com.portfolio.dto.SlabChangeRequestDTO;
+import com.portfolio.dto.TaxSlabDTO;
+import com.portfolio.entities.OfficeUser;
+import com.portfolio.entity.MakerCheckerOzSlab;
+import com.portfolio.exception.OneZappException;
+import com.portfolio.common.Constants;
+import com.portfolio.repository.*;
+import com.portfolio.service.SlabMakerCheckerService;
+import io.micrometer.common.util.StringUtils;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.Date;
+import java.util.List;
+import java.util.Optional;
+
+@Slf4j
+@Service
+public class SlabMakerCheckerServiceImpl implements SlabMakerCheckerService {
+
+    @Autowired
+    MakerCheckerOzSlabRepository makerCheckerOzSlabRepository;
+
+    @Autowired
+    OzSlabFeeRepository ozSlabFeeRepository;
+
+    @Autowired
+    OzSlabTaxRepository ozSlabTaxRepository;
+
+    @Autowired
+    OfficeUserRepository officeUserRepository;
+
+    private static final int ACTIVE = 1;
+    private static final int INACTIVE = 0;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public String processSlabMakerCheckerRequest(SlabChangeRequestDTO requestDTO,
+                                                 Integer officeUserId) throws OneZappException {
+
+        int requestedStatus = requestDTO.getStatus();
+
+        // ── STATUS = 4 (PENDING) or 1 (SUBMITTED) : MAKER CREATES & SUBMITS ──
+        if (requestedStatus == Integer.parseInt(Constants.MakerCheckerStatus.PENDING.getValue())
+                || requestedStatus == Integer.parseInt(Constants.MakerCheckerStatus.SUBMITTED.getValue())) {
+
+            if (requestDTO.getCashId() == null) {
+                throw new OneZappException(Constants.FAILURE_CODE,
+                        "CashId is required to create a change request",
+                        String.valueOf(HttpStatus.BAD_REQUEST));
+            }
+
+            // Block duplicate active request for same cashId
+            Optional<MakerCheckerOzSlab> makerCheckerEntry =  makerCheckerOzSlabRepository.findActiveByCashIdAndUserGroupId(requestDTO.getCashId(), requestDTO.getUserGroupId());
+                    if(makerCheckerEntry.isPresent()) {
+                            throw new OneZappException(Constants.FAILURE_CODE,
+                                    "An active change request already exists for CashId: "
+                                            + requestDTO.getCashId() + " and UserGroup " + requestDTO.getUserGroupId(), String.valueOf(HttpStatus.BAD_REQUEST));
+
+                    }
+
+            // Snapshot current live values from oz_slab_fee
+            List<ServiceFeeSlabsDTO> currentFee = ozSlabFeeRepository
+                    .findSlabByCashId(requestDTO.getCashId(), requestDTO.getUserGroupId());
+
+            // Snapshot current live values from oz_slab_tax
+            List<TaxSlabDTO> currentTax = requestDTO.getTaxId() != null
+                    ? ozSlabTaxRepository.findSlabByTaxId(requestDTO.getTaxId(), requestDTO.getUserGroupId())
+                    : null;
+
+            MakerCheckerOzSlab record = new MakerCheckerOzSlab();
+            record.setCashId(requestDTO.getCashId());
+            record.setUserGroupId(requestDTO.getUserGroupId());
+            record.setTaxId(requestDTO.getTaxId());
+
+            // Set new values
+            record.setNewCommission(requestDTO.getNewCommission());
+            record.setNewDiscount(requestDTO.getNewDiscount());
+            record.setNewServiceCharge(requestDTO.getNewServiceCharge());
+            record.setNewServiceTax(requestDTO.getNewServiceTax());
+            record.setNewDiscountTax(requestDTO.getNewDiscountTax());
+            record.setNewSalesTax(requestDTO.getNewSalesTax());
+
+            // Set old values snapshot
+            if (currentFee != null && !currentFee.isEmpty()) {
+                ServiceFeeSlabsDTO fee = currentFee.get(0);
+                record.setOldCommission(fee.getCommission());
+                record.setCommissionType(fee.getCommissionType());
+                record.setOldDiscount(fee.getDiscount());
+                record.setDiscountType(fee.getDiscountType());
+                record.setOldServiceCharge(fee.getServiceCharge());
+                record.setServiceChargeType(fee.getServiceChargeType());
+            }
+            if (currentTax != null && !currentTax.isEmpty()) {
+                TaxSlabDTO tax = currentTax.get(0);
+                record.setOldServiceTax(tax.getServiceTax());
+                record.setServiceTaxType(tax.getServiceTaxType());
+                record.setOldDiscountTax(tax.getDiscountTax());
+                record.setDiscountTaxType(tax.getDiscountTaxType());
+                record.setOldSalesTax(tax.getSalesTax());
+                record.setSalesTaxType(tax.getSalesTaxType());
+            }
+
+            record.setMakerComment(requestDTO.getComment());
+
+            // Always save as SUBMITTED directly — no draft/pending state
+            record.setMakerCheckerStatusId(
+                    Integer.parseInt(Constants.MakerCheckerStatus.SUBMITTED.getValue()));
+            record.setMakerId(officeUserId);
+            record.setActiveIndex(ACTIVE);
+
+            MakerCheckerOzSlab savedRecord = makerCheckerOzSlabRepository.save(record);
+
+            // ── ADDED: Notify Checkers after Submission ──
+            sendEmail(savedRecord, Constants.MakerCheckerEmailType.CUSTOMER_CHECKER_NOTIFY.getEmailType(), "SERVICES_CONFIG_MAKER");
+
+            log.info("Maker created and submitted slab change request for cashId: {}", requestDTO.getCashId());
+            return "Slab change request submitted successfully";
+
+
+        }
+
+        // ── STATUS = 2 : CHECKER APPROVES ─────────────────────────────────
+        if (requestedStatus == Integer.parseInt(Constants.MakerCheckerStatus.APPROVED.getValue())) {
+
+
+            if (requestDTO.getChangeIds() != null && !requestDTO.getChangeIds().isEmpty()) {
+
+                int success = 0;
+                int failed = 0;
+
+                for (Integer changeId : requestDTO.getChangeIds()) {
+                    try {
+                        approveSingle(changeId, requestDTO.getComment(), officeUserId);
+                        success++;
+                    } catch (Exception e) {
+                        log.error("Failed to approve changeId: {}", changeId, e);
+                        failed++;
+                    }
+                }
+
+                return "Bulk approval completed. Success: " + success + ", Failed: " + failed;
+            }
+
+//            // 🔹 SINGLE FLOW (existing behavior)
+//            approveSingle(requestDTO.getChangeId(), requestDTO.getComment(), officeUserId);
+//            return "Slab change request approved successfully";
+        }
+
+        // ── STATUS = 3 : CHECKER REJECTS ──────────────────────────────────
+        if (requestedStatus == Integer.parseInt(Constants.MakerCheckerStatus.REJECTED.getValue())) {
+
+            if (requestDTO.getChangeIds() != null && !requestDTO.getChangeIds().isEmpty()) {
+
+                int success = 0;
+                int failed = 0;
+
+                for (Integer changeId : requestDTO.getChangeIds()) {
+                    try {
+                        rejectSingle(changeId, requestDTO.getComment(), officeUserId);
+                        success++;
+                    } catch (Exception e) {
+                        log.error("Failed to reject changeId: {}", changeId, e);
+                        failed++;
+                    }
+                }
+
+                return "Bulk rejection completed. Success: " + success + ", Failed: " + failed;
+            }
+
+//            // 🔹 SINGLE FLOW (existing behavior)
+//            rejectSingle(requestDTO.getChangeId(), requestDTO.getComment(), officeUserId);
+//            return "Slab change request rejected successfully";
+        }
+
+        throw new OneZappException(Constants.FAILURE_CODE,
+                "Invalid status: " + requestedStatus,
+                String.valueOf(HttpStatus.BAD_REQUEST));
+    }
+
+
+    private void approveSingle(Integer changeId, String comment, Integer officeUserId) throws OneZappException {
+
+        MakerCheckerOzSlab record = makerCheckerOzSlabRepository
+                .findByChangeId(changeId)
+                .orElseThrow(() -> new OneZappException(Constants.FAILURE_CODE,
+                        "Change request not found for id: " + changeId));
+
+        if (record.getMakerCheckerStatusId() !=
+                Integer.parseInt(Constants.MakerCheckerStatus.SUBMITTED.getValue())) {
+            throw new OneZappException(Constants.FAILURE_CODE,
+                    "Only SUBMITTED requests can be approved");
+        }
+
+        if (record.getMakerId().equals(officeUserId)) {
+            throw new OneZappException(Constants.FAILURE_CODE,
+                    "Maker cannot approve their own request");
+        }
+
+
+        if (record.getNewCommission() != null) {
+            ozSlabFeeRepository.updateFee(record.getCashId(), "TX_COMMISSION", record.getNewCommission(),record.getUserGroupId());
+        }
+        if (record.getNewDiscount() != null) {
+            ozSlabFeeRepository.updateFee(record.getCashId(), "TX_DISCOUNT", record.getNewDiscount(),record.getUserGroupId());
+        }
+        if (record.getNewServiceCharge() != null) {
+            ozSlabFeeRepository.updateFee(record.getCashId(), "TX_SERVICE_CHARGE", record.getNewServiceCharge(),record.getUserGroupId());
+        }
+
+
+        if (record.getTaxId() != null) {
+            if (record.getNewServiceTax() != null) {
+                ozSlabTaxRepository.updateTax(record.getTaxId(), "TX_SERVICE_CHARGE", record.getNewServiceTax(),record.getUserGroupId());
+            }
+            if (record.getNewDiscountTax() != null) {
+                ozSlabTaxRepository.updateTax(record.getTaxId(), "TX_DISCOUNT", record.getNewDiscountTax(),record.getUserGroupId());
+            }
+            if (record.getNewSalesTax() != null) {
+                ozSlabTaxRepository.updateTax(record.getTaxId(), "TX_SALES_TAX", record.getNewSalesTax(),record.getUserGroupId());
+            }
+        }
+
+
+        record.setMakerCheckerStatusId(
+                Integer.parseInt(Constants.MakerCheckerStatus.APPROVED.getValue()));
+        record.setCheckerId(officeUserId);
+        record.setCheckerComment(comment);
+        record.setActiveIndex(INACTIVE);
+        record.setUpdatedDatetime(new Date());
+
+        MakerCheckerOzSlab savedRecord = makerCheckerOzSlabRepository.save(record);
+        // ── ADDED: Notify Maker that request is APPROVED ──
+        sendEmail(savedRecord, Constants.MakerCheckerEmailType.CUSTOMER_CHECKER_APPROVED.getEmailType(), "SERVICES_CONFIG_CHECKER");
+    }
+
+
+    private void rejectSingle(Integer changeId, String comment, Integer officeUserId) throws OneZappException {
+
+        MakerCheckerOzSlab record = makerCheckerOzSlabRepository
+                .findByChangeId(changeId)
+                .orElseThrow(() -> new OneZappException(Constants.FAILURE_CODE,
+                        "Change request not found for id: " + changeId));
+
+        if (record.getMakerCheckerStatusId() !=
+                Integer.parseInt(Constants.MakerCheckerStatus.SUBMITTED.getValue())) {
+            throw new OneZappException(Constants.FAILURE_CODE,
+                    "Only SUBMITTED requests can be rejected");
+        }
+
+        if (record.getMakerId().equals(officeUserId)) {
+            throw new OneZappException(Constants.FAILURE_CODE,
+                    "Maker cannot reject their own request");
+        }
+
+        record.setMakerCheckerStatusId(
+                Integer.parseInt(Constants.MakerCheckerStatus.REJECTED.getValue()));
+        record.setCheckerId(officeUserId);
+        record.setCheckerComment(comment);
+        record.setActiveIndex(INACTIVE);
+        record.setUpdatedDatetime(new Date());
+
+        MakerCheckerOzSlab savedRecord = makerCheckerOzSlabRepository.save(record);
+        // ── ADDED: Notify Maker that request is REJECTED ──
+        sendEmail(savedRecord, Constants.MakerCheckerEmailType.CUSTOMER_CHECKER_REJECTED.getEmailType(), "SERVICES_CONFIG_CHECKER");
+    }
+
+    // ── ADDED: HELPER METHOD FOR EMAIL ──
+    public void sendEmail(MakerCheckerOzSlab makerCheckerOzSlab, String emailType, String privilegeName) throws OneZappException {
+        List<OfficeUser> officeUsers = null;
+        if (StringUtils.isNotBlank(privilegeName)) {
+            officeUsers = officeUserRepository.getOfficeUserCheckerList(privilegeName);
+        }
+        // Direct call to your static utility
+        EmailUtils.sendUserEmail(makerCheckerOzSlab, officeUsers, emailType);
+    }
+
+
+}
