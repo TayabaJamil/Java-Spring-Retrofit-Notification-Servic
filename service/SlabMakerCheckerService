@@ -1,0 +1,10 @@
+package com.portfolio.service;
+
+import com.portfolio.dto.SlabChangeRequestDTO;
+import com.portfolio.exception.OneZappException;
+
+public interface SlabMakerCheckerService {
+    String processSlabMakerCheckerRequest(SlabChangeRequestDTO requestDTO,
+                                          Integer officeUserId) throws OneZappException;
+
+}
